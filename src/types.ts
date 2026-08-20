@@ -23,6 +23,10 @@ export interface GlobalInputs {
   annualInflationRate: number; // %
   projectionYears: number;
   applyNIIT: boolean; // Net Investment Income Tax (+3.8%)
+  refiOrHeloc: "refi" | "heloc";
+  refiInterestRate: number; // annual %
+  helocInterestRate: number; // annual %
+  refiClosingCostPercent: number; // % of new loan amount
 }
 
 export interface PropertyYearDetail {
@@ -45,6 +49,8 @@ export interface PropertyYearDetail {
 
 export interface YearlySnapshot {
   year: number;
+  // Normalization
+  baselineMonthlyCost: number;
   // Keep scenario breakdown
   keepPropertyValue: number;
   keepMortgageBalance: number;
@@ -61,23 +67,35 @@ export interface YearlySnapshot {
   keepDepreciation: number;
   keepTaxSavings: number;
   keepAnnualCashFlow: number;
-  keepCumulativeCashFlow: number;
-  keepReserveEarnings: number;
-  keepCompoundedCashReserve: number;
+  keepMonthlyInvestment: number;
+  keepPortfolio: number;
+  keepPortfolioEarnings: number;
   keepNetWorth: number;
   // Sell scenario breakdown
   sellPortfolioPreTax: number;
   sellPortfolioEarnings: number;
   sellInvestmentGain: number;
   sellCapitalGainsTax: number;
-  sellMonthlySavings: number;
+  sellMonthlyInvestment: number;
   sellNetWorth: number;
-  // Comparison
-  difference: number;
+  // Refi/HELOC scenario breakdown
+  refiMortgageBalance: number;
+  refiHelocBalance: number;
+  refiAnnualCashFlow: number;
+  refiMonthlyInvestment: number;
+  refiPortfolio: number;
+  refiPortfolioEarnings: number;
+  refiCapitalGainsTax: number;
+  refiNetWorth: number;
+  // Comparisons
+  keepVsSell: number;
+  refiVsSell: number;
 }
 
 export interface PropertyProjection {
   propertyName: string;
   propertyId: number;
   snapshots: YearlySnapshot[];
+  refiBranchYear: number | null;
+  refiEquityExtracted: number;
 }

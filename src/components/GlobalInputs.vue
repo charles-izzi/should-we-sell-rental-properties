@@ -47,10 +47,7 @@ function updateBool(field: keyof GlobalInputs, checked: boolean) {
           type="checkbox"
           :checked="modelValue.applyNIIT"
           @change="
-            updateBool(
-              'applyNIIT',
-              ($event.target as HTMLInputElement).checked,
-            )
+            updateBool('applyNIIT', ($event.target as HTMLInputElement).checked)
           "
         />
         Subject to NIIT (+3.8%)
@@ -90,6 +87,79 @@ function updateBool(field: keyof GlobalInputs, checked: boolean) {
           @input="
             update(
               'investmentReturnRate',
+              ($event.target as HTMLInputElement).value,
+            )
+          "
+        />
+      </label>
+    </fieldset>
+
+    <fieldset>
+      <legend>Refi / Home Equity Loan</legend>
+      <label class="radio-group">
+        <span class="radio-option">
+          <input
+            type="radio"
+            name="refiOrHeloc"
+            value="refi"
+            :checked="modelValue.refiOrHeloc === 'refi'"
+            @change="
+              emit('update:modelValue', { ...modelValue, refiOrHeloc: 'refi' })
+            "
+          />
+          Cash-out Refinance
+        </span>
+        <span class="radio-option">
+          <input
+            type="radio"
+            name="refiOrHeloc"
+            value="heloc"
+            :checked="modelValue.refiOrHeloc === 'heloc'"
+            @change="
+              emit('update:modelValue', { ...modelValue, refiOrHeloc: 'heloc' })
+            "
+          />
+          Home Equity Loan
+        </span>
+      </label>
+      <label>
+        Refi Rate %
+        <input
+          type="number"
+          step="0.25"
+          :value="modelValue.refiInterestRate"
+          @input="
+            update(
+              'refiInterestRate',
+              ($event.target as HTMLInputElement).value,
+            )
+          "
+        />
+      </label>
+      <label>
+        Home Equity Loan Rate %
+        <input
+          type="number"
+          step="0.25"
+          :value="modelValue.helocInterestRate"
+          @input="
+            update(
+              'helocInterestRate',
+              ($event.target as HTMLInputElement).value,
+            )
+          "
+        />
+      </label>
+      <label>
+        Closing Costs %
+        <span class="input-hint">Percentage of the new loan amount.</span>
+        <input
+          type="number"
+          step="0.5"
+          :value="modelValue.refiClosingCostPercent"
+          @input="
+            update(
+              'refiClosingCostPercent',
               ($event.target as HTMLInputElement).value,
             )
           "

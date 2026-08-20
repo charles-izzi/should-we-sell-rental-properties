@@ -33,15 +33,34 @@ function amortizeMonth(
   return { principal, interest, newBalance };
 }
 
+function amortizeYear(
+  startBalance: number,
+  annualRate: number,
+  monthlyPayment: number,
+): { endBalance: number; totalInterest: number; totalPrincipal: number } {
+  let balance = startBalance;
+  let totalInterest = 0;
+  let totalPrincipal = 0;
+  for (let m = 0; m < 12; m++) {
+    if (balance <= 0) break;
+    const { principal, interest, newBalance } = amortizeMonth(
+      balance,
+      annualRate,
+      monthlyPayment,
+    );
+    totalInterest += interest;
+    totalPrincipal += principal;
+    balance = newBalance;
+  }
+  return { endBalance: balance, totalInterest, totalPrincipal };
+}
+
 function computePropertyYear(
   property: PropertyInputs,
   year: number,
   prevBalance: number,
-  prevCumulativeCashFlow: number,
-  prevCompoundedCashReserve: number,
   marginalTaxRate: number,
   inflationRate: number,
-  investmentReturnRate: number,
   depreciationYearsUsedBefore: number,
 ): PropertyYearDetail {
   // Property appreciation (compounded from original current value)
@@ -77,21 +96,12 @@ function computePropertyYear(
   const annualExpenses =
     (Number(property.annualOtherExpenses) || 0) * inflationFactor;
 
-  // Mortgage amortization for 12 months (using only P&I portion)
-  let balance = prevBalance;
-  let totalInterest = 0;
-  let totalPrincipal = 0;
-  for (let m = 0; m < 12; m++) {
-    if (balance <= 0) break;
-    const { principal, interest, newBalance } = amortizeMonth(
-      balance,
-      property.mortgageInterestRate,
-      monthlyPI,
-    );
-    totalInterest += interest;
-    totalPrincipal += principal;
-    balance = newBalance;
-  }
+  // Mortgage amortization for 12 months
+  const {
+    endBalance: balance,
+    totalInterest,
+    totalPrincipal,
+  } = amortizeYear(prevBalance, property.mortgageInterestRate, monthlyPI);
 
   // Annual total payment = actual P&I paid (handles partial-year payoff) + scaled escrow
   const annualTotalPayment = totalPrincipal + totalInterest + annualEscrow;
@@ -104,14 +114,13 @@ function computePropertyYear(
   if (totalDepYears <= 27) {
     annualDepreciation = fullAnnualDep;
   } else if (totalDepYears <= 28) {
-    // Partial year: only the fractional remainder (27.5 - years already used before this year)
     const remainingFraction = Math.max(0, 27.5 - (totalDepYears - 1));
     annualDepreciation = fullAnnualDep * remainingFraction;
   } else {
     annualDepreciation = 0;
   }
 
-  // Tax savings from deductions (escrow, other expenses, mortgage interest, and depreciation are all deductible)
+  // Tax savings from deductions
   const taxSavings =
     (annualEscrow + annualExpenses + totalInterest + annualDepreciation) *
     (marginalTaxRate / 100);
@@ -119,23 +128,6 @@ function computePropertyYear(
   // Net cash flow for the year
   const annualCashFlow =
     yearlyRentBase - annualTotalPayment - annualExpenses + taxSavings;
-  const cumulativeCashFlow = prevCumulativeCashFlow + annualCashFlow;
-
-  // Compound cash reserve: positive cash flow is invested monthly at the same return rate
-  const mr = monthlyRate(investmentReturnRate);
-  const monthlyCashFlow = annualCashFlow / 12;
-  let cashReserve = prevCompoundedCashReserve;
-  let reserveEarnings = 0;
-  for (let m = 0; m < 12; m++) {
-    // Only compound positive balances (no returns on debt)
-    if (cashReserve > 0) {
-      const earnings = cashReserve * mr;
-      reserveEarnings += earnings;
-      cashReserve = cashReserve + earnings + monthlyCashFlow;
-    } else {
-      cashReserve = cashReserve + monthlyCashFlow;
-    }
-  }
 
   return {
     propertyValue,
@@ -150,9 +142,9 @@ function computePropertyYear(
     depreciation: annualDepreciation,
     taxSavings,
     annualCashFlow,
-    cumulativeCashFlow,
-    reserveEarnings,
-    compoundedCashReserve: cashReserve,
+    cumulativeCashFlow: 0, // filled externally if needed
+    reserveEarnings: 0,
+    compoundedCashReserve: 0,
   };
 }
 
@@ -178,11 +170,9 @@ function computePropertySaleTax(
 ): { totalTax: number; recaptureTax: number; capitalGainsTax: number } {
   const adjustedBasis = purchasePrice - accumulatedDepreciation;
   const totalGain = Math.max(0, salePrice - adjustedBasis);
-  // Depreciation recapture is taxed at 25% (+ NIIT if applicable)
   const recaptureAmount = Math.min(accumulatedDepreciation, totalGain);
   const recaptureRate = 25 + (global.applyNIIT ? 3.8 : 0);
   const recaptureTax = recaptureAmount * (recaptureRate / 100);
-  // Remaining gain above purchase price taxed at normal capital gains rate
   const remainingGain = Math.max(0, totalGain - recaptureAmount);
   const capitalGainsTax = remainingGain * (effectiveCapGainsRate(global) / 100);
   return {
@@ -209,49 +199,349 @@ function computeSellProceedsForProperty(
   return p.currentValue - p.mortgageBalance - sellingCosts - totalTax;
 }
 
+// --- Refi scenario helpers ---
+
+interface RefiYearRaw {
+  // Combined remaining debt (refi: single new mortgage; HELOC: original + HELOC)
+  mortgageBalance: number;
+  helocBalance: number;
+  totalDebt: number;
+  annualCashFlow: number;
+  totalInterest: number; // for tax deduction purposes
+}
+
+function computeRefiPath(
+  property: PropertyInputs,
+  global: GlobalInputs,
+  branchYear: number,
+  keepDetails: PropertyYearDetail[],
+): { equityExtracted: number; years: RefiYearRaw[] } {
+  // At branchYear, compute equity extractable
+  const branchDetail = keepDetails[branchYear - 1]; // 0-indexed
+  const propertyValueAtBranch = branchDetail.propertyValue;
+  const mortgageBalanceAtBranch = branchDetail.mortgageBalance;
+  const maxLoan = propertyValueAtBranch * 0.8;
+
+  const isRefi = global.refiOrHeloc === "refi";
+  const rate = isRefi ? global.refiInterestRate : global.helocInterestRate;
+
+  let newLoanAmount: number;
+  if (isRefi) {
+    // Cash-out refi: new mortgage replaces old
+    newLoanAmount = maxLoan;
+  } else {
+    // HELOC: second loan on top of existing
+    newLoanAmount = Math.max(0, maxLoan - mortgageBalanceAtBranch);
+  }
+
+  const closingCosts = newLoanAmount * (global.refiClosingCostPercent / 100);
+  const equityExtracted = isRefi
+    ? newLoanAmount - mortgageBalanceAtBranch - closingCosts
+    : newLoanAmount - closingCosts;
+
+  if (equityExtracted <= 0) {
+    return { equityExtracted: 0, years: [] };
+  }
+
+  // Compute new monthly payment(s)
+  const newLoanMonthlyPI = calculateMonthlyPI(newLoanAmount, rate, 30);
+
+  // For refi: single new mortgage replaces old. For HELOC: keep original + add HELOC payment.
+  const originalMonthlyPI = calculateMonthlyPI(
+    property.mortgageBalance,
+    property.mortgageInterestRate,
+    property.remainingYears,
+  );
+
+  // Amortize from branch year onward
+  const years: RefiYearRaw[] = [];
+  let refiBalance = isRefi ? newLoanAmount : 0;
+  let originalBalance = isRefi ? 0 : mortgageBalanceAtBranch;
+  let helocBalance = isRefi ? 0 : newLoanAmount;
+
+  for (let year = 1; year <= global.projectionYears; year++) {
+    if (year < branchYear) {
+      // Pre-branch: same as keep
+      const kd = keepDetails[year - 1];
+      years.push({
+        mortgageBalance: kd.mortgageBalance,
+        helocBalance: 0,
+        totalDebt: kd.mortgageBalance,
+        annualCashFlow: kd.annualCashFlow,
+        totalInterest: kd.annualMortgageInterest,
+      });
+    } else {
+      // Post-branch: amortize new loan structure
+      const kd = keepDetails[year - 1]; // for property value, rent, escrow, expenses, depreciation, tax info
+
+      let totalInterest = 0;
+      let totalPI = 0;
+
+      if (isRefi) {
+        // Single new mortgage
+        const result = amortizeYear(refiBalance, rate, newLoanMonthlyPI);
+        refiBalance = result.endBalance;
+        totalInterest = result.totalInterest;
+        totalPI = result.totalPrincipal + result.totalInterest;
+      } else {
+        // Original mortgage + HELOC
+        const origResult = amortizeYear(
+          originalBalance,
+          property.mortgageInterestRate,
+          originalMonthlyPI,
+        );
+        originalBalance = origResult.endBalance;
+
+        const helocResult = amortizeYear(helocBalance, rate, newLoanMonthlyPI);
+        helocBalance = helocResult.endBalance;
+
+        totalInterest = origResult.totalInterest + helocResult.totalInterest;
+        totalPI =
+          origResult.totalPrincipal +
+          origResult.totalInterest +
+          helocResult.totalPrincipal +
+          helocResult.totalInterest;
+      }
+
+      // Cash flow uses same rent/escrow/expenses/depreciation as keep, but different P&I
+      const taxSavings =
+        (kd.annualEscrow +
+          kd.annualExpenses +
+          totalInterest +
+          kd.depreciation) *
+        (global.marginalTaxRate / 100);
+      const annualCashFlow =
+        kd.annualRent -
+        totalPI -
+        kd.annualEscrow -
+        kd.annualExpenses +
+        taxSavings;
+
+      years.push({
+        mortgageBalance: isRefi ? refiBalance : originalBalance,
+        helocBalance,
+        totalDebt: isRefi ? refiBalance : originalBalance + helocBalance,
+        annualCashFlow,
+        totalInterest,
+      });
+    }
+  }
+
+  return { equityExtracted, years };
+}
+
+// --- Normalization and portfolio compounding ---
+
+interface PortfolioResult {
+  portfolioValues: number[];
+  portfolioEarnings: number[]; // per-year earnings
+  costBasis: number[]; // cumulative contributions (for tax calculation)
+}
+
+function compoundPortfolio(
+  annualCashFlows: number[], // raw CF per year for the scenario
+  normalizationCFs: number[][], // CFs for normalization baseline (keep + sell only)
+  lumpSum: number,
+  lumpSumYear: number, // 1-indexed year when lump sum is injected (1 = start)
+  investmentReturnRate: number,
+): PortfolioResult {
+  const mr = monthlyRate(investmentReturnRate);
+  const numYears = annualCashFlows.length;
+  const portfolioValues: number[] = [];
+  const portfolioEarnings: number[] = [];
+  const costBasis: number[] = [];
+  let portfolio = lumpSumYear <= 1 ? lumpSum : 0;
+  let totalContributions = lumpSumYear <= 1 ? lumpSum : 0;
+
+  for (let y = 0; y < numYears; y++) {
+    // Inject lump sum at the start of the branch year
+    if (y + 1 === lumpSumYear && lumpSumYear > 1) {
+      portfolio += lumpSum;
+      totalContributions += lumpSum;
+    }
+
+    // Compute baseline for this year: worst CF across normalization scenarios
+    const cfs = normalizationCFs.map((s) => s[y]);
+    const worstCF = Math.min(...cfs, 0);
+    const baselineMonthlyCost = Math.max(0, -worstCF) / 12;
+
+    // This scenario's monthly investment = baseline + own CF / 12
+    const monthlyInvestment = baselineMonthlyCost + annualCashFlows[y] / 12;
+
+    let yearEarnings = 0;
+    for (let m = 0; m < 12; m++) {
+      const earnings = portfolio > 0 ? portfolio * mr : 0;
+      yearEarnings += earnings;
+      portfolio = portfolio + earnings + monthlyInvestment;
+      if (monthlyInvestment > 0) {
+        totalContributions += monthlyInvestment;
+      }
+    }
+
+    portfolioValues.push(portfolio);
+    portfolioEarnings.push(yearEarnings);
+    costBasis.push(totalContributions);
+  }
+
+  return { portfolioValues, portfolioEarnings, costBasis };
+}
+
 function computeProjectionForProperty(
   property: PropertyInputs,
   global: GlobalInputs,
-): YearlySnapshot[] {
-  const snapshots: YearlySnapshot[] = [];
-
-  let balance = property.mortgageBalance;
-  let cumulativeCashFlow = 0;
-  let compoundedCashReserve = 0;
-
+): {
+  snapshots: YearlySnapshot[];
+  refiBranchYear: number | null;
+  refiEquityExtracted: number;
+} {
   const currentYear = new Date().getFullYear();
   const depreciationYearsUsedBefore = Math.max(
     0,
     currentYear - property.rentalStartYear,
   );
-
   const capGainsRate = effectiveCapGainsRate(global);
-  const initialInvestment = computeSellProceedsForProperty(property, global);
-  const monthlyReturn = monthlyRate(global.investmentReturnRate);
-  let portfolio = initialInvestment;
-  let accumulatedDepreciation = computeAccumulatedDepreciation(
-    property.purchasePrice,
-    depreciationYearsUsedBefore,
-  );
+  const sellProceeds = computeSellProceedsForProperty(property, global);
 
+  // --- Pass 1: Compute keep scenario raw year data ---
+  const keepDetails: PropertyYearDetail[] = [];
+  let balance = property.mortgageBalance;
   for (let year = 1; year <= global.projectionYears; year++) {
     const detail = computePropertyYear(
       property,
       year,
       balance,
-      cumulativeCashFlow,
-      compoundedCashReserve,
       global.marginalTaxRate,
       global.annualInflationRate,
-      global.investmentReturnRate,
       depreciationYearsUsedBefore,
     );
     balance = detail.mortgageBalance;
-    cumulativeCashFlow = detail.cumulativeCashFlow;
-    compoundedCashReserve = detail.compoundedCashReserve;
+    keepDetails.push(detail);
+  }
+
+  const keepCFs = keepDetails.map((d) => d.annualCashFlow);
+  const sellCFs = keepDetails.map(() => 0); // sell has no property costs
+
+  // --- Pass 2: Find optimal refi branch year ---
+  let bestBranchYear: number | null = null;
+  let bestPeakAdvantage = -Infinity;
+  let bestRefiPath: ReturnType<typeof computeRefiPath> | null = null;
+
+  // Normalization only between keep and sell (refi excluded to avoid baseline spikes)
+  const normCFs = [keepCFs, sellCFs];
+
+  for (let b = 1; b <= global.projectionYears; b++) {
+    const refiPath = computeRefiPath(property, global, b, keepDetails);
+    if (refiPath.equityExtracted <= 0) continue;
+
+    const refiCFs = refiPath.years.map((y) => y.annualCashFlow);
+
+    // Compute sell and refi portfolios to find peak advantage
+    const sellPortfolio = compoundPortfolio(
+      sellCFs,
+      normCFs,
+      sellProceeds,
+      1,
+      global.investmentReturnRate,
+    );
+    const refiPortfolio = compoundPortfolio(
+      refiCFs,
+      normCFs,
+      refiPath.equityExtracted,
+      b,
+      global.investmentReturnRate,
+    );
+
+    // Find peak refi advantage vs sell
+    let accDep = computeAccumulatedDepreciation(
+      property.purchasePrice,
+      depreciationYearsUsedBefore,
+    );
+    for (let y = 0; y < global.projectionYears; y++) {
+      accDep += keepDetails[y].depreciation;
+      // Only evaluate from branch year onward
+      if (y + 1 < b) continue;
+      const refiDebt = refiPath.years[y].totalDebt;
+      const propValue = keepDetails[y].propertyValue;
+      const sellingCosts = propValue * (global.sellingCostPercent / 100);
+      const saleTax = computePropertySaleTax(
+        propValue,
+        property.purchasePrice,
+        accDep,
+        global,
+      );
+      const refiNW =
+        propValue -
+        refiDebt -
+        sellingCosts -
+        saleTax.totalTax +
+        refiPortfolio.portfolioValues[y];
+      // Tax on refi portfolio gains (using cost basis)
+      const refiInvGain = Math.max(
+        0,
+        refiPortfolio.portfolioValues[y] - refiPortfolio.costBasis[y],
+      );
+      const refiNWAfterTax = refiNW - refiInvGain * (capGainsRate / 100);
+
+      const sellInvGain = Math.max(
+        0,
+        sellPortfolio.portfolioValues[y] - sellPortfolio.costBasis[y],
+      );
+      const sellNW =
+        sellPortfolio.portfolioValues[y] - sellInvGain * (capGainsRate / 100);
+
+      const advantage = refiNWAfterTax - sellNW;
+      if (advantage > bestPeakAdvantage) {
+        bestPeakAdvantage = advantage;
+        bestBranchYear = b;
+        bestRefiPath = refiPath;
+      }
+    }
+  }
+
+  // --- Pass 3: Build final snapshots with the winning refi path ---
+  const refiCFs = bestRefiPath
+    ? bestRefiPath.years.map((y) => y.annualCashFlow)
+    : keepCFs; // fallback: refi = keep if no equity
+  const refiEquityExtracted = bestRefiPath?.equityExtracted ?? 0;
+
+  // Normalize only between keep and sell (refi uses same baseline but own CF)
+  const keepPortfolio = compoundPortfolio(
+    keepCFs,
+    normCFs,
+    0,
+    1,
+    global.investmentReturnRate,
+  );
+  const sellPortfolio = compoundPortfolio(
+    sellCFs,
+    normCFs,
+    sellProceeds,
+    1,
+    global.investmentReturnRate,
+  );
+  const refiPortfolio = compoundPortfolio(
+    refiCFs,
+    normCFs,
+    refiEquityExtracted,
+    bestBranchYear ?? 1,
+    global.investmentReturnRate,
+  );
+
+  const snapshots: YearlySnapshot[] = [];
+  let accumulatedDepreciation = computeAccumulatedDepreciation(
+    property.purchasePrice,
+    depreciationYearsUsedBefore,
+  );
+
+  for (let y = 0; y < global.projectionYears; y++) {
+    const detail = keepDetails[y];
     accumulatedDepreciation += detail.depreciation;
 
-    // Keep scenario: net worth if you sold the property at this point
+    // Baseline monthly cost for this year (keep vs sell only)
+    const worstCF = Math.min(keepCFs[y], sellCFs[y]);
+    const baselineMonthlyCost = Math.max(0, -worstCF) / 12;
+
+    // Keep net worth
     const sellingCosts =
       detail.propertyValue * (global.sellingCostPercent / 100);
     const saleTax = computePropertySaleTax(
@@ -260,30 +550,57 @@ function computeProjectionForProperty(
       accumulatedDepreciation,
       global,
     );
-    const keepNetWorth =
+    const keepNW =
       detail.propertyValue -
       detail.mortgageBalance -
       sellingCosts -
       saleTax.totalTax +
-      detail.compoundedCashReserve;
+      keepPortfolio.portfolioValues[y];
+    // Tax on keep portfolio gains (only on gains above cost basis)
+    const keepInvGain = Math.max(
+      0,
+      keepPortfolio.portfolioValues[y] - keepPortfolio.costBasis[y],
+    );
+    const keepPortfolioTax = keepInvGain * (capGainsRate / 100);
+    const keepNetWorth = keepNW - keepPortfolioTax;
 
-    // Dynamic monthly savings: if property has negative cash flow, that's money saved by selling
-    const monthlySavings = Math.max(0, -detail.annualCashFlow / 12);
+    // Sell net worth
+    const sellInvGain = Math.max(
+      0,
+      sellPortfolio.portfolioValues[y] - sellPortfolio.costBasis[y],
+    );
+    const sellCapGainsTax = sellInvGain * (capGainsRate / 100);
+    const sellNetWorth = sellPortfolio.portfolioValues[y] - sellCapGainsTax;
 
-    const portfolioBefore = portfolio;
-    for (let m = 0; m < 12; m++) {
-      portfolio = portfolio * (1 + monthlyReturn) + monthlySavings;
+    // Refi net worth (only meaningful from branch year onward)
+    const refiYear = bestRefiPath ? bestRefiPath.years[y] : null;
+    const isBranched = bestBranchYear !== null && y + 1 >= bestBranchYear;
+    let refiNetWorth: number;
+    let refiCapGainsTax: number;
+    if (isBranched) {
+      const refiDebt = refiYear ? refiYear.totalDebt : detail.mortgageBalance;
+      const refiNWRaw =
+        detail.propertyValue -
+        refiDebt -
+        sellingCosts -
+        saleTax.totalTax +
+        refiPortfolio.portfolioValues[y];
+      const refiInvGain = Math.max(
+        0,
+        refiPortfolio.portfolioValues[y] - refiPortfolio.costBasis[y],
+      );
+      refiCapGainsTax = refiInvGain * (capGainsRate / 100);
+      refiNetWorth = refiNWRaw - refiCapGainsTax;
+    } else {
+      // Pre-branch: refi scenario doesn't exist yet, matches keep
+      refiNetWorth = keepNetWorth;
+      refiCapGainsTax = 0;
     }
-    const sellPortfolioEarnings =
-      portfolio - portfolioBefore - monthlySavings * 12;
-
-    // Sell scenario: net worth if you liquidated the investment at this point
-    const investmentGain = Math.max(0, portfolio - initialInvestment);
-    const capitalGainsTaxOnInvestment = investmentGain * (capGainsRate / 100);
-    const sellNetWorth = portfolio - capitalGainsTaxOnInvestment;
 
     snapshots.push({
-      year,
+      year: y + 1,
+      baselineMonthlyCost,
+      // Keep
       keepPropertyValue: detail.propertyValue,
       keepMortgageBalance: detail.mortgageBalance,
       keepEquity: detail.equity,
@@ -299,32 +616,49 @@ function computeProjectionForProperty(
       keepDepreciation: detail.depreciation,
       keepTaxSavings: detail.taxSavings,
       keepAnnualCashFlow: detail.annualCashFlow,
-      keepCumulativeCashFlow: detail.cumulativeCashFlow,
-      keepReserveEarnings: detail.reserveEarnings,
-      keepCompoundedCashReserve: detail.compoundedCashReserve,
+      keepMonthlyInvestment: baselineMonthlyCost + keepCFs[y] / 12,
+      keepPortfolio: keepPortfolio.portfolioValues[y],
+      keepPortfolioEarnings: keepPortfolio.portfolioEarnings[y],
       keepNetWorth,
-      sellPortfolioPreTax: portfolio,
-      sellPortfolioEarnings,
-      sellInvestmentGain: investmentGain,
-      sellCapitalGainsTax: capitalGainsTaxOnInvestment,
-      sellMonthlySavings: monthlySavings,
+      // Sell
+      sellPortfolioPreTax: sellPortfolio.portfolioValues[y],
+      sellPortfolioEarnings: sellPortfolio.portfolioEarnings[y],
+      sellInvestmentGain: sellInvGain,
+      sellCapitalGainsTax: sellCapGainsTax,
+      sellMonthlyInvestment: baselineMonthlyCost + sellCFs[y] / 12,
       sellNetWorth,
-      difference: keepNetWorth - sellNetWorth,
+      // Refi
+      refiMortgageBalance: refiYear?.mortgageBalance ?? detail.mortgageBalance,
+      refiHelocBalance: refiYear?.helocBalance ?? 0,
+      refiAnnualCashFlow: refiCFs[y],
+      refiMonthlyInvestment: baselineMonthlyCost + refiCFs[y] / 12,
+      refiPortfolio: refiPortfolio.portfolioValues[y],
+      refiPortfolioEarnings: refiPortfolio.portfolioEarnings[y],
+      refiCapitalGainsTax: refiCapGainsTax,
+      refiNetWorth,
+      // Comparisons
+      keepVsSell: keepNetWorth - sellNetWorth,
+      refiVsSell: refiNetWorth - sellNetWorth,
     });
   }
 
-  return snapshots;
+  return { snapshots, refiBranchYear: bestBranchYear, refiEquityExtracted };
 }
 
 export function computeProjection(
   properties: PropertyInputs[],
   global: GlobalInputs,
 ): PropertyProjection[] {
-  return properties.map((p) => ({
-    propertyName: p.name,
-    propertyId: p.id,
-    snapshots: computeProjectionForProperty(p, global),
-  }));
+  return properties.map((p) => {
+    const result = computeProjectionForProperty(p, global);
+    return {
+      propertyName: p.name,
+      propertyId: p.id,
+      snapshots: result.snapshots,
+      refiBranchYear: result.refiBranchYear,
+      refiEquityExtracted: result.refiEquityExtracted,
+    };
+  });
 }
 
 export function createDefaultProperty(id: number): PropertyInputs {

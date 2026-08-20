@@ -35,9 +35,9 @@ function setCanvasRef(el: unknown, id: number) {
 
 function findBreakEvenYear(proj: PropertyProjection): number | null {
   if (proj.snapshots.length === 0) return null;
-  const firstSign = proj.snapshots[0].difference >= 0;
+  const firstSign = proj.snapshots[0].keepVsSell >= 0;
   for (const s of proj.snapshots) {
-    if (s.difference >= 0 !== firstSign) return s.year;
+    if (s.keepVsSell >= 0 !== firstSign) return s.year;
   }
   return null;
 }
@@ -46,9 +46,9 @@ function findOptimalSellYear(proj: PropertyProjection): number | null {
   if (proj.snapshots.length === 0) return null;
   let best = proj.snapshots[0];
   for (const s of proj.snapshots) {
-    if (s.difference > best.difference) best = s;
+    if (s.keepVsSell > best.keepVsSell) best = s;
   }
-  return best.difference > 0 ? best.year : null;
+  return best.keepVsSell > 0 ? best.year : null;
 }
 
 function buildChart(proj: PropertyProjection) {
@@ -62,9 +62,15 @@ function buildChart(proj: PropertyProjection) {
   const labels = proj.snapshots.map((s) => `Year ${s.year}`);
   const keepData = proj.snapshots.map((s) => s.keepNetWorth);
   const sellData = proj.snapshots.map((s) => s.sellNetWorth);
+  const refiData = proj.snapshots.map((s) =>
+    proj.refiBranchYear && s.year >= proj.refiBranchYear
+      ? s.refiNetWorth
+      : null,
+  );
 
   const breakEven = findBreakEvenYear(proj);
   const optimalSell = findOptimalSellYear(proj);
+  const branchYear = proj.refiBranchYear;
 
   // Build point styles for milestones
   const keepPointRadius = proj.snapshots.map((s) => {
@@ -121,6 +127,26 @@ function buildChart(proj: PropertyProjection) {
             if (s.year === breakEven) return "#ff9800";
             return "#0d6efd";
           }),
+        },
+        {
+          label: "Refi/HE Loan: Net Worth",
+          data: refiData,
+          borderColor: "#e65100",
+          backgroundColor: "rgba(230, 81, 0, 0.1)",
+          fill: false,
+          tension: 0.3,
+          spanGaps: false,
+          pointRadius: proj.snapshots.map((s) => {
+            if (s.year === branchYear) return 10;
+            return 3;
+          }),
+          pointBackgroundColor: proj.snapshots.map((s) => {
+            if (s.year === branchYear) return "#d500f9";
+            return "#e65100";
+          }),
+          pointStyle: proj.snapshots.map((s) =>
+            s.year === branchYear ? "rectDiamond" : "circle",
+          ),
         },
       ],
     },
@@ -208,6 +234,11 @@ watch(
         style="background: #6f42c1; margin-left: 1rem"
       ></span>
       Mortgage paid off
+      <span
+        class="legend-dot"
+        style="background: #d500f9; margin-left: 1rem"
+      ></span>
+      Refi branch point
     </div>
   </div>
 </template>

@@ -57,6 +57,10 @@ const defaultGlobal: GlobalInputs = {
   annualInflationRate: 3,
   projectionYears: 10,
   applyNIIT: false,
+  refiOrHeloc: "refi",
+  refiInterestRate: 7,
+  helocInterestRate: 8.5,
+  refiClosingCostPercent: 2,
 };
 
 const globalInputs = ref<GlobalInputs>({
